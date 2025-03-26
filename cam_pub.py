@@ -5,6 +5,7 @@ DepthAI摄像头ROS2发布节点
 - 持续发布高质量图像到ROS2话题
 - 支持参数化配置分辨率和图像质量
 - 针对Ubuntu 22.04 + ROS2 Humble环境优化
+- 增加畸变校正功能
 """
 
 import depthai as dai
@@ -78,7 +79,7 @@ class ROS2ImagePublisher(Node):
             except Exception as e:
                 self.get_logger().error(f"发布图像失败: {str(e)}")
 
-def get_camera_info(frame, intrinsic_matrix):
+def get_camera_info(frame, intrinsic_matrix, dist_coeffs=None):
     """创建相机信息消息"""
     if not ROS2_AVAILABLE:
         return None
@@ -105,6 +106,11 @@ def get_camera_info(frame, intrinsic_matrix):
         camera_info.p[5] = float(intrinsic_matrix[1][1])  # fy
         camera_info.p[6] = float(intrinsic_matrix[1][2])  # cy
         camera_info.p[10] = 1.0
+        
+    # 如果有畸变系数，也添加到相机信息中
+    if dist_coeffs is not None:
+        for i in range(min(len(dist_coeffs), 5)):
+            camera_info.d.append(float(dist_coeffs[i]))
     
     return camera_info
 
@@ -137,6 +143,22 @@ def create_pipeline(args):
     cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
     cam_rgb.setFps(args.fps)
     
+    # 启用畸变校正
+    try:
+        cam_rgb.initialControl.setManualFocus(130)  # 适当的对焦值
+        cam_rgb.setIspScale(1, 1)  # 确保不改变分辨率
+        # 尝试设置畸变系数 - 如果此方法可用
+        if hasattr(cam_rgb, 'setDistortionCoefficients'):
+            cam_rgb.setDistortionCoefficients([0, 0, 0, 0, 0])  # 初始设置为0，让设备使用校准参数
+    except Exception as e:
+        print(f"设置相机校正参数时出错: {e}")
+        print("将使用OpenCV进行后处理畸变校正")
+
+    # 创建控制输入队列
+    controlIn = pipeline.create(dai.node.XLinkIn)
+    controlIn.setStreamName("control")
+    controlIn.out.link(cam_rgb.inputControl)
+    
     # 创建输出
     xout_isp = pipeline.create(dai.node.XLinkOut)
     xout_isp.setStreamName("isp")
@@ -164,6 +186,8 @@ def main():
                         help='显示图像窗口')
     parser.add_argument('--no-ros', action='store_true',
                         help='禁用ROS2发布')
+    parser.add_argument('--undistort', action='store_true', default=True,
+                        help='启用畸变校正')
     
     args = parser.parse_args()
     
@@ -210,20 +234,36 @@ def main():
             device_name = device.getDeviceInfo().getMxId()
             print(f"已连接到设备: {device_name}")
             
-            # 如果相机支持，获取内参
+            # 获取相机校准参数
             calib = device.readCalibration()
-            try:
-                intrinsic_matrix = np.array(calib.getCameraIntrinsics(dai.CameraBoardSocket.RGB, 
-                                                                    args.width, args.height))
-            except:
-                try:
-                    # 尝试使用CAM_A (OAK-D)
-                    intrinsic_matrix = np.array(calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, 
-                                                                        args.width, args.height))
-                except:
-                    intrinsic_matrix = None
-                    print("无法获取相机内参")
+            intrinsic_matrix = None
+            dist_coeffs = None
             
+            # 尝试获取内参和畸变系数
+            try:
+                # 首先尝试RGB接口
+                try:
+                    intrinsic_matrix = np.array(calib.getCameraIntrinsics(dai.CameraBoardSocket.RGB, 
+                                                                        args.width, args.height))
+                    dist_coeffs = np.array(calib.getDistortionCoefficients(dai.CameraBoardSocket.RGB))
+                    print(f"成功获取RGB相机内参和畸变系数")
+                except:
+                    # 然后尝试CAM_A (常见于OAK-D和其他设备)
+                    try:
+                        intrinsic_matrix = np.array(calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, 
+                                                                            args.width, args.height))
+                        dist_coeffs = np.array(calib.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A))
+                        print(f"成功获取CAM_A相机内参和畸变系数")
+                    except:
+                        print("无法获取相机内参和畸变系数，将使用默认值")
+            except Exception as e:
+                print(f"获取相机参数时出错: {e}")
+            
+            if intrinsic_matrix is not None:
+                print(f"相机内参矩阵:\n{intrinsic_matrix}")
+            if dist_coeffs is not None:
+                print(f"畸变系数: {dist_coeffs}")
+
             # 获取输出队列
             q_isp = device.getOutputQueue(name="isp", maxSize=4, blocking=False)
             q_preview = device.getOutputQueue(name="preview", maxSize=4, blocking=False)
@@ -234,6 +274,20 @@ def main():
             # 使用时间差计算 FPS，不依赖帧数计数
             start_time = time.time()
             last_fps_print = start_time
+            
+            # 如果启用畸变校正且有必要的参数
+            use_opencv_undistort = args.undistort and intrinsic_matrix is not None and dist_coeffs is not None
+            if use_opencv_undistort:
+                print("使用OpenCV进行额外的畸变校正")
+                # 计算新的相机矩阵用于校正
+                newcameramtx, roi = cv2.getOptimalNewCameraMatrix(
+                    intrinsic_matrix, dist_coeffs, (args.width, args.height), 0, (args.width, args.height))
+
+            # 控制相机参数
+            controlQueue = device.getInputQueue('control')
+            ctrl = dai.CameraControl()
+            ctrl.setManualFocus(130)  # 设置对焦
+            controlQueue.send(ctrl)
 
             # 主循环中
             while True:
@@ -241,6 +295,11 @@ def main():
                 in_isp = q_isp.tryGet()
                 if in_isp is not None:
                     frame = in_isp.getCvFrame()
+                    
+                    # 应用OpenCV畸变校正（如果启用）
+                    if use_opencv_undistort:
+                        # 使用OpenCV的undistort函数校正畸变
+                        frame = cv2.undistort(frame, intrinsic_matrix, dist_coeffs, None, newcameramtx)
                     
                     # 计算和显示FPS (每秒更新一次)
                     current_time = time.time()
@@ -253,18 +312,35 @@ def main():
                     # 显示图像（如果需要）
                     if args.show:
                         # 显示低分辨率预览
-                        preview = q_preview.tryGet()
-                        if preview is not None:
-                            cv2.imshow("Preview", preview.getCvFrame())
-                            cv2.waitKey(1)
+                        # preview = q_preview.tryGet()
+                        # if preview is not None:
+                        #     preview_frame = preview.getCvFrame()
+                        #     # 对预览图也应用畸变校正（如果启用）
+                        #     if use_opencv_undistort and preview_frame.shape[0] > 0:
+                        #         preview_h, preview_w = preview_frame.shape[:2]
+                        #         # 调整相机矩阵用于预览分辨率
+                        #         scale_x = preview_w / args.width
+                        #         scale_y = preview_h / args.height
+                        #         preview_matrix = intrinsic_matrix.copy()
+                        #         preview_matrix[0,0] *= scale_x  # fx
+                        #         preview_matrix[0,2] *= scale_x  # cx
+                        #         preview_matrix[1,1] *= scale_y  # fy
+                        #         preview_matrix[1,2] *= scale_y  # cy
+                        #         preview_newcameramtx, _ = cv2.getOptimalNewCameraMatrix(
+                        #             preview_matrix, dist_coeffs, (preview_w, preview_h), 0, (preview_w, preview_h))
+                        #         preview_frame = cv2.undistort(preview_frame, preview_matrix, 
+                        #                                     dist_coeffs, None, preview_newcameramtx)
+                            
+                        #     cv2.imshow("Preview", preview_frame)
+                        
                         # 显示高分辨率图像
-                        # cv2.imshow("Video", frame)
-                        # cv2.waitKey(1)  # 确保调用 waitKey 以刷新窗口
+                        cv2.imshow("Video", frame)
+                        cv2.waitKey(1)  # 确保调用 waitKey 以刷新窗口
                     
                     # 发布到ROS2
                     if ros_node:
                         # 创建相机信息
-                        camera_info = get_camera_info(frame, intrinsic_matrix)
+                        camera_info = get_camera_info(frame, intrinsic_matrix, dist_coeffs)
                         # 发布图像和相机信息
                         ros_node.publish_image(frame, camera_info)
                         # 处理ROS2回调
