@@ -1,1 +1,0 @@
-charuco_board_test.py使用图像png,就是charuco_board_generate.py所产生的charuco标定板charuco_board_A4.png，我还没有打印
