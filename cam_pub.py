@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import time
 import argparse
+import threading
 
 try:
     import rclpy
@@ -16,12 +17,11 @@ except ImportError:
     print("ROS2依赖库未找到")
 
 class ROS2ImagePublisher(Node):
-    def __init__(self, node_name="depthai_camera", camera_name="oak", target_fps=5.0):
+    def __init__(self, node_name="depthai_camera", camera_name="oak"):
         super().__init__(node_name)
         self.bridge = CvBridge()
         self.camera_name = camera_name
-        self.target_fps = target_fps
-        self.last_publish_time = time.time()
+        self.lock = threading.Lock()
         
         # 使用与AprilTag节点兼容的QoS设置
         qos = rclpy.qos.QoSProfile(
@@ -34,55 +34,48 @@ class ROS2ImagePublisher(Node):
         self.image_pub = self.create_publisher(Image, f'/{camera_name}/image_raw', qos)
         self.camera_info_pub = self.create_publisher(CameraInfo, f'/{camera_name}/camera_info', qos)
         
-        # 使用直接发布方式，不使用队列和线程
-        self.get_logger().info(f"ROS2图像发布器已初始化，目标发布频率: {target_fps} Hz")
+        # 发布频率统计
+        self.frame_count = 0
+        self.last_stat_time = time.time()
+        
+        self.get_logger().info("ROS2图像发布器已初始化")
 
     def publish_image(self, frame, camera_info):
-        """直接发布图像，使用时间控制来限制发布频率"""
-        current_time = time.time()
-        time_since_last = current_time - self.last_publish_time
-        
-        # 检查是否应该发布这一帧（基于目标帧率）
-        if time_since_last < (1.0 / self.target_fps):
-            return
-            
-        # 更新上次发布时间
-        self.last_publish_time = current_time
-        
+        """直接发布图像和相机信息，保持同步"""
         try:
-            # 转换为灰度图像以减少数据量
-            if len(frame.shape) == 3:
-                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            else:
-                gray_frame = frame
-            
-            # 创建消息
-            msg = self.bridge.cv2_to_imgmsg(gray_frame, encoding="mono8")
-            
-            # 使用相同的时间戳
-            timestamp = self.get_clock().now().to_msg()
-            msg.header.stamp = timestamp
-            msg.header.frame_id = self.camera_name
-            camera_info.header.stamp = timestamp
-            camera_info.header.frame_id = self.camera_name
-            
-            # 先发布相机信息，再发布图像
-            # 这样可以确保接收方在处理图像时已经有了相机信息
-            self.camera_info_pub.publish(camera_info)
-            self.image_pub.publish(msg)
-            
-            # 每10帧打印一次发布频率
-            if hasattr(self, 'publish_count'):
-                self.publish_count += 1
-                if self.publish_count % 10 == 0:
-                    fps = 1.0 / time_since_last if time_since_last > 0 else 0
-                    self.get_logger().info(f"发布频率: {fps:.2f} Hz")
-            else:
-                self.publish_count = 1
+            # 使用锁保证线程安全
+            with self.lock:
+                # 转换为灰度图像以减少数据量
+                if len(frame.shape) == 3:
+                    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray_frame = frame
                 
+                # 创建消息
+                msg = self.bridge.cv2_to_imgmsg(gray_frame, encoding="mono8")
+                
+                # 使用相同的时间戳
+                timestamp = self.get_clock().now().to_msg()
+                msg.header.stamp = timestamp
+                msg.header.frame_id = self.camera_name
+                camera_info.header.stamp = timestamp
+                camera_info.header.frame_id = self.camera_name
+                
+                # 先发布相机信息，再发布图像
+                self.camera_info_pub.publish(camera_info)
+                self.image_pub.publish(msg)
+                
+                # 统计发布频率
+                self.frame_count += 1
+                current_time = time.time()
+                if current_time - self.last_stat_time >= 1.0:
+                    fps = self.frame_count / (current_time - self.last_stat_time)
+                    self.get_logger().info(f"当前发布频率: {fps:.1f} Hz")
+                    self.frame_count = 0
+                    self.last_stat_time = current_time
+                    
         except Exception as e:
             self.get_logger().error(f"发布错误: {str(e)}")
-
 
 def get_camera_info(frame, intrinsic_matrix, dist_coeffs=None):
     from sensor_msgs.msg import CameraInfo
@@ -126,9 +119,8 @@ def create_pipeline(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-r', '--resolution', default='720p', choices=['720p', '1080p', '4K'])
-    parser.add_argument('-f', '--fps', type=float, default=15.0)
-    parser.add_argument('-p', '--publish-fps', type=float, default=10.0,
-                        help='ROS2话题发布频率 (Hz)')
+    parser.add_argument('-f', '--fps', type=float, default=30.0,
+                        help='相机采集帧率 (Hz)')
     parser.add_argument('-d', '--device', default='')
     parser.add_argument('-n', '--name', default='oak')
     parser.add_argument('-s', '--show', action='store_true')
@@ -146,10 +138,13 @@ def main():
             rclpy.init()
             ros_node = ROS2ImagePublisher(
                 node_name='depthai_camera', 
-                camera_name=args.name,
-                target_fps=args.publish_fps
+                camera_name=args.name
             )
-            print(f"ROS2节点已初始化，目标发布频率: {args.publish_fps} Hz")
+            
+            # 创建独立线程处理ROS2消息
+            ros_spin_thread = threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True)
+            ros_spin_thread.start()
+            
         except Exception as e:
             print(f"ROS2初始化失败: {e}")
             ros_node = None
@@ -202,7 +197,6 @@ def main():
                     if ros_node:
                         info = get_camera_info(frame, intrinsic, dist)
                         ros_node.publish_image(frame, info)
-                        rclpy.spin_once(ros_node, timeout_sec=0)
 
     except KeyboardInterrupt:
         print("用户中断")
