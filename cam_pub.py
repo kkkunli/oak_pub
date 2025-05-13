@@ -125,7 +125,7 @@ def main():
     parser.add_argument('-n', '--name', default='oak')
     parser.add_argument('-s', '--show', action='store_true')
     parser.add_argument('--no-ros', action='store_true')
-    parser.add_argument('--undistort', action='store_true', default=True)
+    parser.add_argument('--undistort', action='store_true', default=False)
     args = parser.parse_args()
 
     if args.resolution == '720p': args.width, args.height = 1280, 720
